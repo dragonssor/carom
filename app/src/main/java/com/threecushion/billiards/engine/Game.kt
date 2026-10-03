@@ -63,6 +63,11 @@ class Game(val mode: GameMode = GameMode.THREE_CUSHION, val targetScore: Int = m
 
     fun ball(id: BallId) = balls.first { it.id == id }
 
+    /** Hand the turn to the other player without shooting (the turn button on the score bar). */
+    fun switchTurn() {
+        if (phase == Phase.AIMING) currentPlayer = 1 - currentPlayer
+    }
+
     fun reset() {
         val w = table.width
         val h = table.height

@@ -43,11 +43,12 @@ data class Vec3(val x: Double, val y: Double, val z: Double) {
     }
 }
 
-/** Match-size carom table: 2.84 m x 1.42 m playing surface, 61.5 mm balls. */
+/** Match-size carom table: 2.84 m x 1.42 m playing surface. */
 data class Table(
     val width: Double = 2.84,
     val height: Double = 1.42,
-    val ballRadius: Double = 0.03075,
+    // Drawn and simulated a little larger than a real 61.5 mm ball, as in the reference app.
+    val ballRadius: Double = 0.04,
 )
 
 enum class BallId { WHITE, YELLOW, RED, RED2 }
