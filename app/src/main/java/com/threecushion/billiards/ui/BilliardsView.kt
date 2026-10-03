@@ -15,25 +15,23 @@ import com.threecushion.billiards.engine.GameMode
 import com.threecushion.billiards.engine.Phase
 import com.threecushion.billiards.engine.Replay
 import com.threecushion.billiards.engine.Vec2
-import kotlin.math.PI
 import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.hypot
-import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sin
 import kotlin.math.sqrt
 
 /**
- * The whole game screen.
+ * The whole game screen. The table never rotates: you turn the phone around it,
+ * like walking around a real table.
  *
  * Controls:
- * - Rub a finger anywhere on the table: the cue turns around the cue ball (fine aim).
- * - Touch the cue stick and pull it back: the further you pull, the harder the shot.
- *   Let go (or push forward) to shoot.
- * - Hold one finger down and move a second finger: a big cue ball appears and the second
- *   finger moves the tip position (english, follow, draw).
- * - The small cue ball at the bottom opens the same tip view for one-finger use.
+ * 1. Touch the spot you want to hit toward with the first finger.
+ * 2. Pull that finger back: the cue pulls back with it, and the distance is the power.
+ * 3. While still holding, touch with a second finger and move it to set the tip
+ *    position (english, follow, draw). Lift the second finger to keep it.
+ * 4. Lift the first finger to shoot. Slide back to the start before lifting to cancel.
  */
 class BilliardsView(context: Context) : View(context) {
     private var game = Game()
@@ -42,8 +40,8 @@ class BilliardsView(context: Context) : View(context) {
 
     // Shot setup.
     private var aimAngle = 0.0
-    private var power = 0.0
-    private var peakPower = 0.0
+    private var pullMeters = 0.0
+    private val power get() = (pullMeters / MAX_PULL_METERS).coerceIn(0.0, 1.0)
     private var tipX = 0.0
     private var tipY = 0.0
     private var showGuide = true
@@ -57,6 +55,11 @@ class BilliardsView(context: Context) : View(context) {
     private var message = ""
     private var messageUntil = 0L
     private var lastFrameNanos = 0L
+
+    /** Seconds left in the cue's forward stroke; the ball is struck when it reaches 0. */
+    private var strokeLeft = -1.0
+    private var strokePower = 0.0
+    private var strokeFromMeters = 0.0
 
     // Layout (onSizeChanged).
     private var scale = 1f
@@ -75,11 +78,14 @@ class BilliardsView(context: Context) : View(context) {
     private val menuItems = Array(5) { RectF() }
 
     // Touch state.
-    private enum class Mode { NONE, ROTATE, STROKE, TIP, TIP_WAIT, BUTTON }
+    private enum class Mode { NONE, AIM, TIP, BUTTON, PINNED_TIP }
     private var mode = Mode.NONE
-    private var lastTouchAngle = 0.0
-    private var strokeStartX = 0f
-    private var strokeStartY = 0f
+    private var aimPointerId = -1
+    private var aimPointerUp = false
+    private var anchorX = 0f
+    private var anchorY = 0f
+    private var targetX = 0f
+    private var targetY = 0f
     private var tipPointerId = -1
     private var tipLastX = 0f
     private var tipLastY = 0f
@@ -97,7 +103,7 @@ class BilliardsView(context: Context) : View(context) {
         val barH = dp(34f)
         val margin = dp(6f)
         val t = game.table
-        val rail = 0.075
+        val rail = 0.085
         val availW = w - 2 * margin
         val availH = h - 2 * barH - 2 * margin
         scale = min(availW / (t.width + 2 * rail), availH / (t.height + 2 * rail)).toFloat()
@@ -136,6 +142,7 @@ class BilliardsView(context: Context) : View(context) {
     private fun sx(x: Double) = clothRect.left + (x * scale).toFloat()
     private fun sy(y: Double) = clothRect.top + (y * scale).toFloat()
     private val aimDir get() = Vec2(cos(aimAngle), sin(aimAngle))
+    private val ballR get() = (game.table.ballRadius * scale).toFloat()
 
     private fun aimAtNearestRed() {
         val c = game.cueBall.pos
@@ -150,6 +157,10 @@ class BilliardsView(context: Context) : View(context) {
         val now = System.nanoTime()
         val dt = if (lastFrameNanos == 0L) 0.0 else min((now - lastFrameNanos) / 1e9, 0.05)
         lastFrameNanos = now
+        if (strokeLeft >= 0) {
+            strokeLeft -= dt
+            if (strokeLeft < 0) strike()
+        }
         if (game.phase == Phase.ROLLING) {
             game.update(dt)
             if (game.phase != Phase.ROLLING) onShotFinished()
@@ -160,21 +171,26 @@ class BilliardsView(context: Context) : View(context) {
             if (replayFrame >= frames + 60) replayFrame = -1.0
         }
 
-        canvas.drawColor(Color.rgb(16, 16, 20))
+        canvas.drawColor(Color.rgb(14, 14, 18))
         drawTable(canvas)
         drawBars(canvas)
         val replaying = replayFrame >= 0
+        val aiming = game.phase == Phase.AIMING && !menuOpen
         if (replaying) drawReplay(canvas) else {
-            if (game.phase == Phase.AIMING && showGuide && !menuOpen) drawGuide(canvas)
-            game.balls.forEach { drawBall(canvas, it.id, it.pos) }
-            if (game.phase == Phase.AIMING && !menuOpen) drawCue(canvas)
+            if (aiming && showGuide) drawGuide(canvas)
+            if (aiming && mode == Mode.AIM || mode == Mode.TIP) drawTarget(canvas)
+            if (aiming) drawCue(canvas, shadowOnly = true)
+            game.balls.forEach { b -> Shading.ballShadow(canvas, paint, sx(b.pos.x), sy(b.pos.y), ballR) }
+            game.balls.forEach { b -> Shading.ball(canvas, paint, sx(b.pos.x), sy(b.pos.y), ballR, ballColor(b.id), shadow = false) }
+            if (aiming) drawCue(canvas, shadowOnly = false)
+            if (aiming && (mode == Mode.AIM || mode == Mode.TIP) && power > 0) drawPowerGauge(canvas)
         }
         drawMessage(canvas)
-        if (mode == Mode.TIP || mode == Mode.TIP_WAIT || tipPinned) drawTipOverlay(canvas)
+        if (mode == Mode.TIP || tipPinned) drawTipOverlay(canvas)
         if (game.phase == Phase.GAME_OVER && !menuOpen) drawGameOver(canvas)
         if (menuOpen) drawMenu(canvas)
 
-        if (game.phase == Phase.ROLLING || replaying || System.currentTimeMillis() < messageUntil) {
+        if (game.phase == Phase.ROLLING || replaying || strokeLeft >= 0 || System.currentTimeMillis() < messageUntil) {
             postInvalidateOnAnimation()
         } else {
             lastFrameNanos = 0L
@@ -182,41 +198,41 @@ class BilliardsView(context: Context) : View(context) {
     }
 
     private fun clothColor() =
-        if (game.mode == GameMode.THREE_CUSHION) Color.rgb(46, 128, 214) else Color.rgb(52, 158, 86)
+        if (game.mode == GameMode.THREE_CUSHION) Color.rgb(36, 112, 196) else Color.rgb(40, 140, 72)
 
     private fun drawTable(canvas: Canvas) {
+        // Drop shadow of the whole table.
         paint.style = Paint.Style.FILL
-        paint.color = Color.rgb(84, 40, 22)
-        canvas.drawRoundRect(railRect, dp(10f), dp(10f), paint)
-        // Cushion strip, a little darker than the cloth.
-        paint.color = darker(clothColor(), 0.75f)
-        val c = dp(5f)
-        canvas.drawRect(clothRect.left - c, clothRect.top - c, clothRect.right + c, clothRect.bottom + c, paint)
-        paint.color = clothColor()
-        canvas.drawRect(clothRect, paint)
-        paint.color = Color.rgb(240, 230, 205)
-        val d = dp(2.2f)
-        val midTop = (railRect.top + clothRect.top) / 2 - c / 2
-        val midBottom = (railRect.bottom + clothRect.bottom) / 2 + c / 2
-        val midLeft = (railRect.left + clothRect.left) / 2 - c / 2
-        val midRight = (railRect.right + clothRect.right) / 2 + c / 2
+        paint.color = Color.argb(90, 0, 0, 0)
+        canvas.drawRoundRect(RectF(railRect.left + dp(4f), railRect.top + dp(6f), railRect.right + dp(4f), railRect.bottom + dp(6f)), dp(12f), dp(12f), paint)
+        val cushion = dp(6f)
+        Shading.rail(canvas, paint, railRect, RectF(clothRect.left - cushion, clothRect.top - cushion, clothRect.right + cushion, clothRect.bottom + cushion), dp(12f))
+        Shading.cloth(canvas, paint, clothRect, clothColor())
+        Shading.cushions(canvas, paint, clothRect, cushion, clothColor())
+        val d = dp(2.6f)
+        val midTop = (railRect.top + clothRect.top - cushion) / 2
+        val midBottom = (railRect.bottom + clothRect.bottom + cushion) / 2
+        val midLeft = (railRect.left + clothRect.left - cushion) / 2
+        val midRight = (railRect.right + clothRect.right + cushion) / 2
         for (i in 1..7) {
             val x = clothRect.left + clothRect.width() * i / 8
-            canvas.drawCircle(x, midTop, d, paint)
-            canvas.drawCircle(x, midBottom, d, paint)
+            Shading.diamond(canvas, paint, x, midTop, d)
+            Shading.diamond(canvas, paint, x, midBottom, d)
         }
         for (i in 1..3) {
             val y = clothRect.top + clothRect.height() * i / 4
-            canvas.drawCircle(midLeft, y, d, paint)
-            canvas.drawCircle(midRight, y, d, paint)
+            Shading.diamond(canvas, paint, midLeft, y, d)
+            Shading.diamond(canvas, paint, midRight, y, d)
         }
     }
 
     private fun drawBars(canvas: Canvas) {
         paint.style = Paint.Style.FILL
-        paint.color = Color.rgb(196, 182, 160)
-        canvas.drawRoundRect(topBar, dp(6f), dp(6f), paint)
-        canvas.drawRoundRect(bottomBar, dp(6f), dp(6f), paint)
+        for (bar in listOf(topBar, bottomBar)) {
+            paint.shader = android.graphics.LinearGradient(0f, bar.top, 0f, bar.bottom, intArrayOf(Color.rgb(214, 202, 182), Color.rgb(170, 156, 134)), null, android.graphics.Shader.TileMode.CLAMP)
+            canvas.drawRoundRect(bar, dp(6f), dp(6f), paint)
+        }
+        paint.shader = null
 
         drawPlayerIcon(canvas, p1Icon, BallId.WHITE, game.currentPlayer == 0)
         drawPlayerIcon(canvas, p2Icon, BallId.YELLOW, game.currentPlayer == 1)
@@ -226,10 +242,8 @@ class BilliardsView(context: Context) : View(context) {
         drawButton(canvas, menuButton, "메뉴")
         drawButton(canvas, undoButton, "되돌리기", enabled = game.canUndo)
         drawButton(canvas, replayButton, "리플레이", enabled = game.replay != null && game.phase != Phase.ROLLING)
-        // Mini cue ball showing the current tip position.
         val r = tipButton.height() / 2
-        paint.color = Color.rgb(250, 250, 245)
-        canvas.drawCircle(tipButton.centerX(), tipButton.centerY(), r, paint)
+        Shading.ball(canvas, paint, tipButton.centerX(), tipButton.centerY(), r, Color.rgb(248, 248, 242), shadow = false)
         paint.color = Color.rgb(200, 30, 40)
         canvas.drawCircle(tipButton.centerX() + (tipX * r).toFloat(), tipButton.centerY() - (tipY * r).toFloat(), r * 0.22f, paint)
     }
@@ -237,35 +251,37 @@ class BilliardsView(context: Context) : View(context) {
     private fun drawPlayerIcon(canvas: Canvas, rect: RectF, id: BallId, active: Boolean) {
         val r = rect.height() / 2
         if (active) {
-            paint.color = Color.argb(160, 255, 220, 80)
-            canvas.drawCircle(rect.centerX(), rect.centerY(), r * 1.15f, paint)
+            paint.color = Color.argb(170, 255, 214, 70)
+            canvas.drawCircle(rect.centerX(), rect.centerY(), r * 1.12f, paint)
         }
-        paint.color = ballColor(id)
-        canvas.drawCircle(rect.centerX(), rect.centerY(), r * 0.8f, paint)
+        Shading.ball(canvas, paint, rect.centerX(), rect.centerY(), r * 0.8f, ballColor(id), shadow = false)
     }
 
     /** Abacus-style score beads, like the counters above a real billiards table. */
     private fun drawBeads(canvas: Canvas, rect: RectF, score: Int) {
-        paint.color = Color.rgb(70, 60, 50)
+        paint.color = Color.rgb(80, 70, 58)
         val wireY = rect.centerY()
         canvas.drawRect(rect.left, wireY - dp(1f), rect.right, wireY + dp(1f), paint)
         val n = game.targetScore
         val beadW = min(dp(9f), rect.width() / (n + 6))
         val gap = beadW * 0.12f
-        // Scored beads slide to the right, the rest wait on the left.
         for (i in 0 until n) {
             val scored = i >= n - score
             val x = if (scored) rect.right - (n - i) * (beadW + gap) else rect.left + i * (beadW + gap)
-            paint.color = if (scored) Color.rgb(205, 35, 45) else Color.rgb(245, 240, 230)
-            val group = (i / 5) % 2 == 1
-            if (!scored && group) paint.color = Color.rgb(225, 215, 200)
-            canvas.drawRoundRect(RectF(x, rect.top, x + beadW, rect.bottom), beadW / 2, beadW / 2, paint)
+            val color = when {
+                scored -> Color.rgb(205, 35, 45)
+                (i / 5) % 2 == 1 -> Color.rgb(222, 212, 196)
+                else -> Color.rgb(245, 240, 230)
+            }
+            Shading.bead(canvas, paint, RectF(x, rect.top, x + beadW, rect.bottom), color)
         }
     }
 
     private fun drawButton(canvas: Canvas, rect: RectF, label: String, enabled: Boolean = true) {
-        paint.color = if (pressedButton === rect) Color.rgb(120, 100, 80) else Color.rgb(150, 132, 110)
+        val base = if (pressedButton === rect) Color.rgb(110, 92, 72) else Color.rgb(140, 122, 100)
+        paint.shader = android.graphics.LinearGradient(0f, rect.top, 0f, rect.bottom, intArrayOf(Shading.lighter(base, 0.15f), Shading.darker(base, 0.15f)), null, android.graphics.Shader.TileMode.CLAMP)
         canvas.drawRoundRect(rect, dp(5f), dp(5f), paint)
+        paint.shader = null
         text.textAlign = Paint.Align.CENTER
         text.textSize = rect.height() * 0.38f
         text.color = if (enabled) Color.WHITE else Color.argb(110, 255, 255, 255)
@@ -274,22 +290,9 @@ class BilliardsView(context: Context) : View(context) {
     }
 
     private fun ballColor(id: BallId) = when (id) {
-        BallId.WHITE -> Color.rgb(248, 248, 242)
-        BallId.YELLOW -> Color.rgb(252, 196, 30)
-        BallId.RED, BallId.RED2 -> Color.rgb(214, 28, 38)
-    }
-
-    private fun drawBall(canvas: Canvas, id: BallId, pos: Vec2) {
-        val r = (game.table.ballRadius * scale).toFloat()
-        val x = sx(pos.x)
-        val y = sy(pos.y)
-        paint.style = Paint.Style.FILL
-        paint.color = Color.argb(70, 0, 0, 0)
-        canvas.drawCircle(x + r * 0.2f, y + r * 0.25f, r, paint)
-        paint.color = ballColor(id)
-        canvas.drawCircle(x, y, r, paint)
-        paint.color = Color.argb(150, 255, 255, 255)
-        canvas.drawCircle(x - r * 0.35f, y - r * 0.35f, r * 0.28f, paint)
+        BallId.WHITE -> Color.rgb(246, 244, 236)
+        BallId.YELLOW -> Color.rgb(250, 190, 24)
+        BallId.RED, BallId.RED2 -> Color.rgb(206, 22, 32)
     }
 
     private fun drawGuide(canvas: Canvas) {
@@ -297,55 +300,81 @@ class BilliardsView(context: Context) : View(context) {
         val c = game.cueBall.pos
         paint.style = Paint.Style.STROKE
         paint.strokeWidth = dp(1f)
-        paint.color = Color.argb(150, 255, 255, 255)
+        paint.color = Color.argb(140, 255, 255, 255)
         canvas.drawLine(sx(c.x), sy(c.y), sx(pred.contact.x), sy(pred.contact.y), paint)
-        val r = (game.table.ballRadius * scale).toFloat()
         if (pred.hitBall != null) {
-            canvas.drawCircle(sx(pred.contact.x), sy(pred.contact.y), r, paint)
+            canvas.drawCircle(sx(pred.contact.x), sy(pred.contact.y), ballR, paint)
         } else if (pred.reflected != null) {
             val end = pred.contact + pred.reflected * 0.25
-            paint.color = Color.argb(80, 255, 255, 255)
+            paint.color = Color.argb(70, 255, 255, 255)
             canvas.drawLine(sx(pred.contact.x), sy(pred.contact.y), sx(end.x), sy(end.y), paint)
         }
         paint.style = Paint.Style.FILL
     }
 
-    /** Cue stick: tip [gap] behind the ball, pulled further back by the current power. */
-    private fun cueSegment(): Pair<Vec2, Vec2> {
-        val c = game.cueBall.pos
-        val back = -aimDir
-        val gap = game.table.ballRadius * 1.6 + power * MAX_PULL_METERS
-        val tip = c + back * gap
-        return tip to tip + back * 1.45
+    /** Ring where the first finger touched: the direction the ball will go. */
+    private fun drawTarget(canvas: Canvas) {
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = dp(1.5f)
+        paint.color = Color.argb(200, 255, 240, 120)
+        canvas.drawCircle(targetX, targetY, dp(14f), paint)
+        canvas.drawLine(targetX - dp(20f), targetY, targetX + dp(20f), targetY, paint)
+        canvas.drawLine(targetX, targetY - dp(20f), targetX, targetY + dp(20f), paint)
+        paint.style = Paint.Style.FILL
     }
 
-    private fun drawCue(canvas: Canvas) {
-        val (tip, butt) = cueSegment()
-        paint.style = Paint.Style.STROKE
-        paint.strokeCap = Paint.Cap.ROUND
-        val back = -aimDir
-        // Shaft (light), butt (dark), ferrule and tip.
-        val wrap = tip + back * 0.9
-        paint.strokeWidth = dp(4.5f)
-        paint.color = Color.rgb(222, 196, 150)
-        canvas.drawLine(sx(tip.x), sy(tip.y), sx(wrap.x), sy(wrap.y), paint)
-        paint.strokeWidth = dp(6f)
-        paint.color = Color.rgb(60, 36, 24)
-        canvas.drawLine(sx(wrap.x), sy(wrap.y), sx(butt.x), sy(butt.y), paint)
-        paint.strokeWidth = dp(4.5f)
-        paint.color = Color.rgb(250, 250, 250)
-        val ferrule = tip + back * 0.025
-        canvas.drawLine(sx(tip.x), sy(tip.y), sx(ferrule.x), sy(ferrule.y), paint)
-        paint.color = Color.rgb(50, 110, 190)
-        val tipEnd = tip + back * 0.006
-        canvas.drawLine(sx(tip.x), sy(tip.y), sx(tipEnd.x), sy(tipEnd.y), paint)
-        paint.strokeCap = Paint.Cap.BUTT
-        paint.style = Paint.Style.FILL
-        if (mode == Mode.STROKE && power > 0) {
-            text.textAlign = Paint.Align.CENTER
-            text.textSize = dp(14f)
-            canvas.drawText("힘 ${(power * 100).toInt()}%", clothRect.centerX(), clothRect.top + dp(22f), text)
+    /** Distance from the ball center back to the cue tip, in meters. */
+    private fun cueGapMeters(): Double {
+        val base = game.table.ballRadius * 1.5
+        if (strokeLeft >= 0) {
+            val t = (strokeLeft / STROKE_SECONDS).coerceIn(0.0, 1.0)
+            return game.table.ballRadius + (base - game.table.ballRadius + strokeFromMeters) * t
         }
+        return base + pullMeters
+    }
+
+    private fun drawCue(canvas: Canvas, shadowOnly: Boolean) {
+        val c = game.cueBall.pos
+        val back = -aimDir
+        val tip = c + back * cueGapMeters()
+        val butt = tip + back * 1.45
+        val wrapStart = tip + back * 0.85
+        val wrapEnd = tip + back * 1.15
+        if (shadowOnly) {
+            paint.style = Paint.Style.STROKE
+            paint.strokeCap = Paint.Cap.ROUND
+            paint.strokeWidth = dp(5.5f)
+            paint.color = Color.argb(60, 0, 0, 0)
+            val o = dp(7f)
+            canvas.drawLine(sx(tip.x) + o, sy(tip.y) + o * 1.4f, sx(butt.x) + o, sy(butt.y) + o * 1.4f, paint)
+            paint.strokeCap = Paint.Cap.BUTT
+            paint.style = Paint.Style.FILL
+            return
+        }
+        paint.strokeCap = Paint.Cap.ROUND
+        Shading.cylinder(canvas, paint, sx(tip.x), sy(tip.y), sx(wrapStart.x), sy(wrapStart.y), dp(4.5f), Color.rgb(214, 180, 128))
+        Shading.cylinder(canvas, paint, sx(wrapStart.x), sy(wrapStart.y), sx(wrapEnd.x), sy(wrapEnd.y), dp(5.6f), Color.rgb(40, 40, 46))
+        Shading.cylinder(canvas, paint, sx(wrapEnd.x), sy(wrapEnd.y), sx(butt.x), sy(butt.y), dp(6.4f), Color.rgb(92, 40, 22))
+        val ferrule = tip + back * 0.022
+        Shading.cylinder(canvas, paint, sx(tip.x), sy(tip.y), sx(ferrule.x), sy(ferrule.y), dp(4.5f), Color.rgb(238, 236, 228))
+        val tipEnd = tip + back * 0.005
+        Shading.cylinder(canvas, paint, sx(tip.x), sy(tip.y), sx(tipEnd.x), sy(tipEnd.y), dp(4.5f), Color.rgb(46, 100, 176))
+        paint.strokeCap = Paint.Cap.BUTT
+    }
+
+    private fun drawPowerGauge(canvas: Canvas) {
+        val w = dp(160f)
+        val h = dp(10f)
+        val x = clothRect.centerX() - w / 2
+        val y = clothRect.top + dp(14f)
+        paint.color = Color.argb(120, 0, 0, 0)
+        canvas.drawRoundRect(RectF(x - dp(3f), y - dp(3f), x + w + dp(3f), y + h + dp(3f)), dp(6f), dp(6f), paint)
+        val p = power.toFloat()
+        paint.color = Shading.mix(Color.rgb(90, 210, 90), Color.rgb(235, 60, 40), p)
+        canvas.drawRoundRect(RectF(x, y, x + w * p, y + h), dp(5f), dp(5f), paint)
+        text.textAlign = Paint.Align.CENTER
+        text.textSize = dp(12f)
+        canvas.drawText("힘 ${(p * 100).toInt()}%", clothRect.centerX(), y + h + dp(16f), text)
     }
 
     private fun drawReplay(canvas: Canvas) {
@@ -359,11 +388,14 @@ class BilliardsView(context: Context) : View(context) {
                 val p = replay.frames[f][b]
                 if (f == 0) path.moveTo(sx(p.x), sy(p.y)) else path.lineTo(sx(p.x), sy(p.y))
             }
-            paint.color = if (id == BallId.WHITE) Color.argb(220, 255, 255, 255) else ballColor(id)
+            paint.color = ballColor(id)
             canvas.drawPath(path, paint)
         }
         paint.style = Paint.Style.FILL
-        replay.ballIds.forEachIndexed { b, id -> drawBall(canvas, id, replay.frames[idx][b]) }
+        replay.ballIds.forEachIndexed { b, id ->
+            val p = replay.frames[idx][b]
+            Shading.ball(canvas, paint, sx(p.x), sy(p.y), ballR, ballColor(id))
+        }
         text.textAlign = Paint.Align.CENTER
         text.textSize = dp(13f)
         canvas.drawText("리플레이 · 탭하면 닫기", clothRect.centerX(), clothRect.bottom - dp(10f), text)
@@ -389,11 +421,7 @@ class BilliardsView(context: Context) : View(context) {
         paint.color = Color.argb(150, 0, 0, 0)
         canvas.drawRect(clothRect, paint)
         val r = tipRadius
-        paint.color = ballColor(game.cueBallId)
-        canvas.drawCircle(tipCenterX, tipCenterY, r, paint)
-        paint.color = Color.argb(90, 255, 255, 255)
-        canvas.drawCircle(tipCenterX - r * 0.35f, tipCenterY - r * 0.35f, r * 0.25f, paint)
-        // Miscue limit.
+        Shading.ball(canvas, paint, tipCenterX, tipCenterY, r, ballColor(game.cueBallId))
         paint.style = Paint.Style.STROKE
         paint.strokeWidth = dp(1f)
         paint.color = Color.argb(90, 0, 0, 0)
@@ -405,8 +433,7 @@ class BilliardsView(context: Context) : View(context) {
         canvas.drawLine(clothRect.left, py, clothRect.right, py, paint)
         canvas.drawLine(px, clothRect.top, px, clothRect.bottom, paint)
         paint.style = Paint.Style.FILL
-        paint.color = Color.rgb(50, 110, 190)
-        canvas.drawCircle(px, py, dp(9f), paint)
+        Shading.ball(canvas, paint, px, py, dp(9f), Color.rgb(46, 100, 176), shadow = false)
         text.textAlign = Paint.Align.LEFT
         text.textSize = dp(13f)
         val side = when {
@@ -447,7 +474,7 @@ class BilliardsView(context: Context) : View(context) {
         canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), paint)
         text.textAlign = Paint.Align.CENTER
         text.textSize = dp(22f)
-        canvas.drawText("당구", width / 2f, menuItems[0].top - dp(18f), text)
+        canvas.drawText("당구", width / 2f, menuItems[0].top - dp(30f), text)
         menuLabels().forEachIndexed { i, label ->
             val rect = menuItems[i]
             paint.color = when {
@@ -459,6 +486,10 @@ class BilliardsView(context: Context) : View(context) {
             text.textSize = dp(16f)
             canvas.drawText(label, rect.centerX(), rect.centerY() + dp(6f), text)
         }
+        text.textSize = dp(12f)
+        text.color = Color.argb(180, 255, 255, 255)
+        canvas.drawText("치고 싶은 곳을 누르고 → 뒤로 당겨 힘 조절 → 두 번째 손가락으로 당점 → 손을 떼면 샷", width / 2f, menuItems[0].top - dp(9f), text)
+        text.color = Color.WHITE
     }
 
     // ---------------------------------------------------------------- game flow
@@ -479,11 +510,22 @@ class BilliardsView(context: Context) : View(context) {
         aimAtNearestRed()
     }
 
-    private fun shoot(p: Double) {
-        if (game.phase != Phase.AIMING || p < 0.02) return
-        game.shoot(aimDir, p, tipX, tipY)
-        power = 0.0
-        peakPower = 0.0
+    /** Start the cue's forward stroke; the ball is struck at the end of it. */
+    private fun release() {
+        if (game.phase != Phase.AIMING || power < MIN_POWER) {
+            pullMeters = 0.0
+            return
+        }
+        strokePower = power
+        strokeFromMeters = pullMeters
+        strokeLeft = STROKE_SECONDS
+        pullMeters = 0.0
+        lastFrameNanos = 0L
+    }
+
+    private fun strike() {
+        strokeLeft = -1.0
+        game.shoot(aimDir, strokePower, tipX, tipY)
         lastFrameNanos = 0L
     }
 
@@ -517,24 +559,6 @@ class BilliardsView(context: Context) : View(context) {
         return candidates.firstOrNull { it.contains(x, y) }
     }
 
-    private fun angleAroundCue(x: Float, y: Float): Double {
-        val c = game.cueBall.pos
-        return atan2((y - sy(c.y)).toDouble(), (x - sx(c.x)).toDouble())
-    }
-
-    private fun nearCue(x: Float, y: Float): Boolean {
-        val (tip, butt) = cueSegment()
-        val ax = sx(tip.x)
-        val ay = sy(tip.y)
-        val bx = sx(butt.x)
-        val by = sy(butt.y)
-        val dx = bx - ax
-        val dy = by - ay
-        val len2 = dx * dx + dy * dy
-        val t = (((x - ax) * dx + (y - ay) * dy) / len2).coerceIn(0f, 1f)
-        return hypot(x - (ax + t * dx), y - (ay + t * dy)) < dp(30f)
-    }
-
     private fun setTipFromPoint(x: Float, y: Float) {
         tipX = ((x - tipCenterX) / tipRadius).toDouble()
         tipY = (-(y - tipCenterY) / tipRadius).toDouble()
@@ -550,28 +574,42 @@ class BilliardsView(context: Context) : View(context) {
     }
 
     override fun onTouchEvent(e: MotionEvent): Boolean {
-        val x = e.getX(e.actionIndex)
-        val y = e.getY(e.actionIndex)
+        val i = e.actionIndex
+        val x = e.getX(i)
+        val y = e.getY(i)
         when (e.actionMasked) {
-            MotionEvent.ACTION_DOWN -> onFirstDown(x, y)
+            MotionEvent.ACTION_DOWN -> onFirstDown(e.getPointerId(i), x, y)
             MotionEvent.ACTION_POINTER_DOWN -> {
-                // A second finger switches to tip control, whatever the first finger was doing.
-                if (!menuOpen && game.phase == Phase.AIMING && mode != Mode.BUTTON && replayFrame < 0) {
-                    if (mode == Mode.STROKE) power = 0.0
+                // A second finger while aiming adjusts the tip; the pull is held where it is.
+                if (mode == Mode.AIM) {
                     mode = Mode.TIP
-                    tipPointerId = e.getPointerId(e.actionIndex)
+                    tipPointerId = e.getPointerId(i)
                     tipLastX = x
                     tipLastY = y
                 }
             }
             MotionEvent.ACTION_MOVE -> onMove(e)
             MotionEvent.ACTION_POINTER_UP -> {
-                if (mode == Mode.TIP && e.getPointerId(e.actionIndex) == tipPointerId) mode = Mode.TIP_WAIT
+                val id = e.getPointerId(i)
+                if (mode == Mode.TIP && id == tipPointerId) {
+                    mode = if (aimPointerUp) Mode.NONE else Mode.AIM
+                    // Re-anchor so the held pull does not jump if the first finger drifted.
+                    val ai = e.findPointerIndex(aimPointerId)
+                    if (ai >= 0) {
+                        val back = -aimDir
+                        anchorX = e.getX(ai) - (back.x * pullMeters * scale).toFloat()
+                        anchorY = e.getY(ai) - (back.y * pullMeters * scale).toFloat()
+                    }
+                    if (aimPointerUp) release()
+                } else if (id == aimPointerId && mode == Mode.TIP) {
+                    // First finger lifted before the second: shoot once the second one lifts too.
+                    aimPointerUp = true
+                }
             }
             MotionEvent.ACTION_UP -> onLastUp(x, y)
             MotionEvent.ACTION_CANCEL -> {
                 mode = Mode.NONE
-                power = 0.0
+                pullMeters = 0.0
                 pressedButton = null
             }
         }
@@ -579,86 +617,72 @@ class BilliardsView(context: Context) : View(context) {
         return true
     }
 
-    private fun onFirstDown(x: Float, y: Float) {
+    private fun onFirstDown(id: Int, x: Float, y: Float) {
         buttonAt(x, y)?.let {
             pressedButton = it
             mode = Mode.BUTTON
             return
         }
-        if (menuOpen) return
+        if (menuOpen || strokeLeft >= 0) return
         if (replayFrame >= 0) {
             replayFrame = -1.0
-            mode = Mode.NONE
             return
         }
         if (game.phase == Phase.GAME_OVER) {
             menuOpen = true
-            mode = Mode.NONE
             return
         }
         if (game.phase != Phase.AIMING) return
         if (tipPinned) {
-            val inside = hypot(x - tipCenterX, y - tipCenterY) <= tipRadius
-            if (inside) {
+            if (hypot(x - tipCenterX, y - tipCenterY) <= tipRadius) {
                 setTipFromPoint(x, y)
-                mode = Mode.TIP_WAIT
+                mode = Mode.PINNED_TIP
             } else {
                 tipPinned = false
-                mode = Mode.NONE
             }
             return
         }
-        if (nearCue(x, y)) {
-            mode = Mode.STROKE
-            strokeStartX = x
-            strokeStartY = y
-            power = 0.0
-            peakPower = 0.0
-        } else {
-            mode = Mode.ROTATE
-            lastTouchAngle = angleAroundCue(x, y)
-        }
+        // Aim at the touched spot (unless it is right on the cue ball).
+        val c = game.cueBall.pos
+        val dx = x - sx(c.x)
+        val dy = y - sy(c.y)
+        if (hypot(dx, dy) > ballR * 1.5f) aimAngle = atan2(dy.toDouble(), dx.toDouble())
+        mode = Mode.AIM
+        aimPointerId = id
+        aimPointerUp = false
+        anchorX = x
+        anchorY = y
+        targetX = x
+        targetY = y
+        pullMeters = 0.0
     }
 
     private fun onMove(e: MotionEvent) {
-        val x = e.getX(0)
-        val y = e.getY(0)
         when (mode) {
-            Mode.ROTATE -> {
-                val a = angleAroundCue(x, y)
-                var d = a - lastTouchAngle
-                if (d > PI) d -= 2 * PI
-                if (d < -PI) d += 2 * PI
-                aimAngle += d * ROTATE_GAIN
-                lastTouchAngle = a
-            }
-            Mode.STROKE -> {
-                // Pull distance along the cue, away from the ball.
+            Mode.AIM -> {
+                val i = e.findPointerIndex(aimPointerId)
+                if (i < 0) return
+                // Only the movement straight back along the cue counts, one to one, like drawing a real cue.
                 val back = -aimDir
-                val pulled = (x - strokeStartX) * back.x + (y - strokeStartY) * back.y
-                val maxPull = width * 0.3
-                power = (pulled / maxPull).coerceIn(0.0, 1.0)
-                peakPower = max(peakPower, power)
-                // Pushing forward again after a pull is a stroke.
-                if (peakPower > 0.05 && power < peakPower * 0.4) {
-                    val p = peakPower
-                    mode = Mode.NONE
-                    shoot(p)
-                }
+                val pulledPx = (e.getX(i) - anchorX) * back.x + (e.getY(i) - anchorY) * back.y
+                pullMeters = (pulledPx / scale).coerceIn(0.0, MAX_PULL_METERS)
             }
             Mode.TIP -> {
                 val i = e.findPointerIndex(tipPointerId)
-                if (i >= 0) {
-                    val tx = e.getX(i)
-                    val ty = e.getY(i)
-                    tipX += (tx - tipLastX) / tipRadius * TIP_GAIN
-                    tipY -= (ty - tipLastY) / tipRadius * TIP_GAIN
-                    clampTip()
-                    tipLastX = tx
-                    tipLastY = ty
-                }
+                if (i < 0) return
+                val tx = e.getX(i)
+                val ty = e.getY(i)
+                tipX += (tx - tipLastX) / tipRadius * TIP_GAIN
+                tipY -= (ty - tipLastY) / tipRadius * TIP_GAIN
+                clampTip()
+                tipLastX = tx
+                tipLastY = ty
             }
-            Mode.TIP_WAIT -> if (tipPinned && hypot(x - tipCenterX, y - tipCenterY) <= tipRadius * 1.1f) setTipFromPoint(x, y)
+            Mode.PINNED_TIP -> {
+                val x = e.getX(0)
+                val y = e.getY(0)
+                if (hypot(x - tipCenterX, y - tipCenterY) <= tipRadius * 1.1f) setTipFromPoint(x, y)
+            }
             else -> Unit
         }
     }
@@ -669,22 +693,21 @@ class BilliardsView(context: Context) : View(context) {
                 val b = pressedButton
                 if (b != null && b.contains(x, y)) onButton(b)
             }
-            Mode.STROKE -> shoot(power)
+            Mode.AIM -> release()
+            Mode.TIP -> release()
             else -> Unit
         }
         mode = Mode.NONE
-        power = 0.0
+        pullMeters = 0.0
         pressedButton = null
     }
 
     companion object {
-        /** How far back the drawn cue moves at full power, in meters. */
-        const val MAX_PULL_METERS = 0.3
-        const val ROTATE_GAIN = 0.35
+        /** How far the cue can be drawn back, in table meters; full pull is full power. */
+        const val MAX_PULL_METERS = 0.5
+        const val MIN_POWER = 0.03
+        const val STROKE_SECONDS = 0.09
         const val TIP_GAIN = 0.8
         const val TIP_LIMIT = 0.7
-
-        private fun darker(color: Int, f: Float) =
-            Color.rgb((Color.red(color) * f).toInt(), (Color.green(color) * f).toInt(), (Color.blue(color) * f).toInt())
     }
 }
